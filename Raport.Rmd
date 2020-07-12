@@ -1,0 +1,286 @@
+---
+title: "raport"
+author: "Karol Mućk"
+date: "17 05 2020"
+output: rmarkdown::github_document
+---
+```{r include=FALSE}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(MASS)
+library(rpart)
+library(randomForest)
+library(ranger)
+```
+
+Celem projektu jest przeanalizowanie zbioru zawierającego ekspresję genów w liniach komórkowych oraz działanie leku na nowotworowe linie komórkowe oraz stworzenie i wytrenowanie modelu który przewidwywał by działanie leku na innych danych.
+
+Wczytanie danych:
+
+```{r}
+load("cancer.RData")
+
+x <- as.matrix(data.train[,-1])
+y <- (data.train$Y)
+
+dim(x)
+```
+
+<b> Zadanie 1 </b>
+
+Zbiór danych zawiera 17737 zmiennych, z czego wszystkie są zmiennymi ilościowymi.
+Do wyboru zmiennych o największej zmienności skorzystamy z współczynnika zmienności wyliczonego ze wzoru 
+$V = \frac{s}{\overline{x}}$, $\overline{x} \ne 0$. Gdzie $s$ jest odchyleniem standardowym z próby, natomiast $\overline{x}$ jest średnią artymetyczną z próby.
+
+```{r}
+n = ncol(x)
+coeff_Var = sd(x[,1]) / mean(x[,1])
+
+for(i in 2:n)
+{
+  var =  sd(x[,i]) / mean(x[,i])
+  coeff_Var = c(coeff_Var, var)
+}
+```
+
+Teraz wybierzemy te zmienne które mają największy współczynnik.
+
+```{r}
+index <- which(coeff_Var >= sort(coeff_Var, decreasing=T)[500], arr.ind=TRUE)
+buff = x[,index]
+```
+
+Oraz policzmy macierz korelacji dla tych zmiennych.
+
+```{r}
+res <- cor(buff)
+res <-round(res, 2)
+```
+
+Wykres wygląda następująco:
+
+```{r}
+all_res <- c(res)
+zeros = replicate(500, 0)
+
+df <- data.frame(zeros,all_res)
+
+ggplot(df, aes(x=zeros, y=all_res)) + 
+  geom_violin(trim=FALSE,fill = "#00AFBB", color= "#00AFBB") +theme_minimal()
+
+```
+
+Warto tu dodać, że macierz zawiera wszystkie wartości dwukrotnie, oraz na diagonali mamy same 1, ale nie przeszkadza to na wykresie, dlatego nie pozbyłem się ich.
+
+<b> Zadanie 2 </b>
+
+Rregrsja Elastic Net łączy w sobie cechy regresji grzbietowej oraz lasso. Metoda polega na minimalizacji następującego wzoru:
+$$\hat{\beta} = arg\min_{\beta}||y -X \beta||^{2}+\lambda(\alpha ||\beta||^{2} +(1-\alpha) ||\beta||_{1})$$
+Dla $\alpha = 0$ metoda jest równoważna metodzie grzbietowej, natomiast dla $\alpha = 1$ metodzie lasso.
+
+
+<b> Zadanie 3</b>
+
+Do wybrania zbioru najlepszych predyktorów zastosujemy metodę analizy grafów (metoda Bartosiewicz) ["Procedura "stopniowego" konstruowania liniowych modeli ekonometrycznych o wielu zmiennych objaśniających", Stanisława Bartosiewicz 2007]. Metoda działa w następujących etatpach:
+
+1. wyznaczamy wartość krytyczną $r^{*} = \sqrt{\frac{t_{\alpha,n-2}^{2}}{t_{\alpha,n-2}^{2}+ n-2}}$, gdzie $t_{\alpha,n-2}$ jest wartością testu t Studenta dla poziomu istotność $\alpha$ oraz n-2 stopni swobody.
+2. Eliminuje się ze zbioru zmiennych te zmienne dla których korelacja jest zmienną objaśnianą jest mniejsza od krytycznej $r^{*}$
+3. Z pozostałych zmiennych wybieramy taką zmienną $(X_{h})$, dla której korelacja ze zmienną objaśnianą jest największa.
+4. Eliminuje się ze zbioru potencjalnych zmiennych te wszystkie, dla ktorych korelacja ze zmienną $X_{h}$, jest większa od krtycznej.
+
+Sekwencję możemy powtarzać, aż zostanie optymalna dla nas liczba zmiennych.
+
+
+
+<b> Zadanie 4</b>
+
+
+Zobaczmy wymiar zbioru danych.
+```{r}
+dim(data.train)
+```
+
+Zbiór danych ma bardzo dużo zmiennych, dlatego obetniemy zbiór do zmiennych które okazały się najlepsze stosując metodę z porzedniego zadania.
+
+```{r}
+n = ncol(x)
+m = nrow(x)
+t_alpha = qt(0.995, df=m-2) 
+r_star = sqrt(t_alpha^2 / (t_alpha^2 + m - 2))
+
+
+R0 = replicate(n, 0)
+
+for (i in 1:n )
+{
+  R0[i] = cor(x[,i],data.train$Y, method = "pearson")
+}
+
+index = c()
+
+for (i in 1:n )
+{
+  if (abs(R0[i]) <= r_star)
+  {
+    index = c(index,i)
+    
+  }
+}
+
+R0 = R0[-length(R0)]
+absmax <- function(x) { x[which.max( abs(x) )]}
+rh = which(R0==absmax(R0))
+
+
+Rhi = replicate(n, 0)
+
+for (i in 1:n )
+{
+  Rhi[i] = cor(x[,i],x[,rh], method = "pearson")
+}
+
+
+for (i in 1:n )
+{
+  if (abs(Rhi[i]) > r_star & !is.element(i, index))
+  {
+    index = c(index,i)
+    
+  }
+}
+
+data.train = subset(data.train, select = -index)
+
+dim(data.train)
+```
+
+Dzięki tej metodzie zostało nam tylko 291 zmiennych. 
+
+
+Aby znaleźć najlepsze parametry dla modelu lasu losowego oraz regresji elastic net zastosujemy metodę wyszykiwania po siatce (ang. Grid Search), polegajacej na testowaniu wiele kombinacji parametrów tuningowych. Do znalezienia odpowiednich wartości zastosujemy funckje glmnet.  Z uwagii, że predyckje w zadniu 5 będą ocenianie na pomocą błędu średniokwadratowego (RMSE), to będzie dla nas najbardziej istotna informacja.
+
+
+
+Do eksperymentów ustawimy stałe zairno, tak, aby losowość dla każdej próby była "taka sama".
+
+```{r}
+set.seed(100)
+```
+
+Teraz dostroimy model regresji elastic net.
+```{r warning=FALSE}
+cv_5 = trainControl(method = "cv", number = 5)
+model <- train(Y ~., data = data.train, method = "glmnet",trControl = trainControl("cv", number = 10),tuneLength = 10)
+
+```
+Zobaczmy jak wyglądają wyniki:
+```{r}
+model
+```
+
+Oraz najlepsze prametry:
+```{r}
+model$bestTune
+```
+Tabelka jest dość duża, ponieważ mamy aż dwie wartości do dostrojenia. Najlepsze okazało się wybór $\alpha = 0.1$, $\lambda = 0.05285036$.
+
+
+Teraz dostrójmy model lasów losowych.
+```{r eval=FALSE}
+sosenka <- randomForest(formula = Y ~ .,data = data.train)
+plot(sosenka)
+```
+
+```{r echo=FALSE, fig.cap="", out.width = '90%'}
+knitr::include_graphics("sosenka.png")
+```
+
+Wykres przedstawia błąd lasu losowego w zależności od liczebności drzew. Sprawdźmy dla jakiej wartości lasów błąd jest najmniejszy.
+
+```{r eval=FALSE}
+which.min(sosenka$mse)
+```
+
+
+```{r echo=FALSE}
+print(211)
+```
+
+Zatem 211 drzew wydaje się najbardziej opytmalną liczbą. Widzimy również, że tak naprawdę ta różnica nie jest jakaś strasznie istotna jeśli liczba drzew przekroczy 200.
+
+Teraz dostroimy resztę parametrów, pownonie korzystając z przeszukwiania po siadce.
+
+stwórzmy siatkę:
+```{r}
+hyper_grid <- expand.grid(
+  mtry       = seq(20, 30, by = 2),
+  node_size  = seq(3, 9, by = 2),
+  sampe_size = c(.55, .632, .70, .80),
+  RMSE   = 0)
+
+```
+
+Sprawdźmy ile łącznie przetestujemy kombinacji:
+
+```{r}
+nrow(hyper_grid)
+```
+
+Teraz pora na proces dostrajania:
+```{r}
+for(i in 1:nrow(hyper_grid)) {
+  # train model
+  tree <- ranger(
+    formula         = Y ~ ., 
+    data            = data.train, 
+    num.trees       = 211,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    sample.fraction = hyper_grid$sampe_size[i],
+  )
+  
+  # add OOB error to grid
+  hyper_grid$RMSE[i] <- sqrt(tree$prediction.error)
+}
+```
+
+
+Wypiszmy te wartości dla których błąd okazał się najmniejszy:
+```{r}
+hyper_grid %>% 
+  dplyr::arrange(RMSE) %>%
+  head(10)
+```
+AIC
+
+
+<b> Zadanie 5</b>
+Widzimy, że najlepiej na zbiorze trenignowym sprawdził się model elstic net  dlatego za pomocą jego przewidzenia zmiennej objaśnianej.
+
+Na początku nusimy ze zbioru testowego wybrać te same zmienne na których trenowaliśmy nasz model.
+
+```{r}
+data.test = subset(data.test, select = -index)
+x_test <- as.matrix(data.test)
+
+x <- as.matrix(data.train[,-1])
+
+dim(x_test) #upewnijmy się że wymiary się zgadzają
+```
+
+Teraz wytrenujemy model.
+
+```{r}
+
+main_model <- glmnet(x, y, alpha = 0.1 , lambda = 0.05285036)
+```
+
+Ostanim krokiem jest przewidzenie zmiennej objaśnainej dla zbioru testowego i zapisanie odpowiedniego wektora.
+
+```{r eval=FALSE}
+
+pred <- main_model %>% predict(x_test) %>% as.vector()
+
+save(pred, file = "Muck.RData")
+```
